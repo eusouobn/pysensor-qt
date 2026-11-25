@@ -1,0 +1,2046 @@
+#!/usr/bin/env python3
+import csv
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QListWidget,
+    QMenu,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_NAME = "pysensor-qt"
+HWMON = Path("/sys/class/hwmon")
+THERMAL = Path("/sys/class/thermal")
+
+CATEGORIES = [
+    "Usage",
+    "Temp",
+    "Fan",
+    "PWM",
+    "Volt",
+    "Power",
+    "Curr",
+    "Energy",
+    "Status",
+]
+
+CATEGORY_ORDER = {
+    "Usage": 0,
+    "Temp": 1,
+    "Fan": 2,
+    "PWM": 3,
+    "Volt": 4,
+    "Power": 5,
+    "Curr": 6,
+    "Energy": 7,
+    "Status": 8,
+    "Other": 99,
+}
+
+HARDWARE_GROUPS = [
+    ("CPU", ("k10temp", "zenpower", "coretemp", "cpu_thermal", "cpu", "amdcpu")),
+    ("GPU", ("amdgpu", "radeon", "nvidia")),
+    ("Board", ("nct", "nuvoton", "it87")),
+    ("Storage", ("nvme", "drivetemp")),
+    ("Memory", ("spd5118",)),
+    ("System", ("system", "acpitz", "thermal", "iwlwifi", "wifi")),
+]
+
+HARDWARE_TAGS = ["CPU", "GPU", "MB", "SSD", "RAM", "SYS"]
+HARDWARE_COLORS = ["#4FC3F7", "#81C784", "#FFB74D", "#BA68C8", "#F06292", "#90A4AE"]
+
+
+def hardware_tag(row) -> str:
+    """Short badge shown next to each sensor name."""
+    index = hardware_group(row)
+    return HARDWARE_TAGS[index] if index < len(HARDWARE_TAGS) else "OTH"
+
+
+def hardware_color(row) -> QColor:
+    index = hardware_group(row)
+    return QColor(HARDWARE_COLORS[index] if index < len(HARDWARE_COLORS) else "#90A4AE")
+
+
+def hardware_group(row) -> int:
+    """Hardware group used by the sort order (CPU, GPU, board...)."""
+    try:
+        chip = row.key.split("|", 1)[1].split("/", 1)[0].lower()
+    except (IndexError, AttributeError):
+        chip = str(getattr(row, "key", "")).lower()
+
+    for index, (_title, prefixes) in enumerate(HARDWARE_GROUPS):
+        if any(chip.startswith(prefix) or prefix in chip for prefix in prefixes):
+            return index
+    return len(HARDWARE_GROUPS)
+
+
+_LAST_CPU_TOTAL = None
+_LAST_CPU_IDLE = None
+
+_LAST_NVIDIA_USAGE_ROWS = []
+_LAST_NVIDIA_USAGE_TIME = 0.0
+_LAST_NVIDIA_SENSOR_ROWS = []
+_LAST_NVIDIA_SENSOR_TIME = 0.0
+NVIDIA_CACHE_SECONDS = 8.0
+
+
+@dataclass(frozen=True)
+class Reading:
+    key: str
+    category: str
+    name: str
+    value: object
+    unit: str = ""
+    numeric: float | None = None
+    full_name: str = ""
+
+
+def config_dir() -> Path:
+    base_dir = os.environ.get("XDG_CONFIG_HOME")
+    if base_dir:
+        return Path(base_dir) / APP_NAME
+    return Path.home() / ".config" / APP_NAME
+
+
+SETTINGS_PATH = config_dir() / "settings.json"
+
+# Old Portuguese keys -> English (transparent settings migration).
+CATEGORY_EN = {
+    "Uso": "Usage",
+    "Temperatura": "Temp",
+    "Voltagem": "Volt",
+    "Potência": "Power",
+    "Corrente": "Curr",
+    "Energia": "Energy",
+    "Outro": "Other",
+}
+
+LABEL_EN = {
+    "RAM usada": "RAM used",
+    "RAM disponível": "RAM free",
+    "VRAM usada": "VRAM used",
+    "VRAM livre": "VRAM free",
+    "controlador de memória": "memory controller",
+    "memória": "memory",
+    "Processador": "Processor",
+}
+
+
+def translate_key(key: str) -> str:
+    """Convert 'Temperatura|amdgpu/edge' to 'Temp|amdgpu/edge'."""
+    if "|" not in key:
+        return key
+
+    category, rest = key.split("|", 1)
+    category = CATEGORY_EN.get(category, category)
+
+    if "/" in rest:
+        chip, label = rest.split("/", 1)
+        for old, new in LABEL_EN.items():
+            if label == old:
+                label = new
+                break
+            if label.endswith(" " + old):
+                label = label[: -(len(old) + 1)] + " " + new
+                break
+        rest = f"{chip}/{label}"
+
+    return f"{category}|{rest}"
+
+
+def migrate_settings(settings: dict) -> dict:
+    """Migrate saved Portuguese settings to the new English format."""
+    for field in ("hidden_sensors", "favorite_sensors"):
+        values = settings.get(field)
+        if isinstance(values, list):
+            settings[field] = [translate_key(str(value)) for value in values]
+
+    for field in ("hidden_sensor_info", "favorite_sensor_info"):
+        info = settings.get(field)
+        if isinstance(info, dict):
+            migrated = {}
+            for key, value in info.items():
+                if isinstance(value, dict):
+                    value = dict(value)
+                    if "category" in value:
+                        value["category"] = CATEGORY_EN.get(value["category"], value["category"])
+                migrated[translate_key(str(key))] = value
+            settings[field] = migrated
+
+    visible = settings.get("category_visible")
+    if isinstance(visible, dict):
+        settings["category_visible"] = {
+            CATEGORY_EN.get(key, key): enabled for key, enabled in visible.items()
+        }
+
+    if settings.get("order_mode") == "Categoria":
+        settings["order_mode"] = "Category"
+
+    return settings
+
+
+def load_settings() -> dict:
+    default = {
+        "hidden_sensors": [],
+        "hidden_sensor_info": {},
+        "favorite_sensors": [],
+        "favorite_sensor_info": {},
+        "show_only_favorites": False,
+        "category_visible": {category: True for category in CATEGORIES},
+        "hide_zero": False,
+        "fit_on_startup": True,
+        "window_size": [720, 380],
+    }
+
+    try:
+        if SETTINGS_PATH.exists():
+            loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                default.update(loaded)
+    except Exception:
+        pass
+
+    default = migrate_settings(default)
+
+    # Make sure new categories default to visible.
+    visible = default.get("category_visible", {})
+    if not isinstance(visible, dict):
+        visible = {}
+    for category in CATEGORIES:
+        visible.setdefault(category, True)
+    default["category_visible"] = visible
+
+    if not isinstance(default.get("hidden_sensors"), list):
+        default["hidden_sensors"] = []
+
+    if not isinstance(default.get("hidden_sensor_info"), dict):
+        default["hidden_sensor_info"] = {}
+
+    if not isinstance(default.get("favorite_sensors"), list):
+        default["favorite_sensors"] = []
+
+    if not isinstance(default.get("favorite_sensor_info"), dict):
+        default["favorite_sensor_info"] = {}
+
+    default["show_only_favorites"] = bool(default.get("show_only_favorites", False))
+    default["fit_on_startup"] = bool(default.get("fit_on_startup", True))
+
+    saved_size = default.get("window_size")
+    if not (isinstance(saved_size, list) and len(saved_size) == 2):
+        default["window_size"] = [720, 380]
+
+    return default
+
+
+def save_settings(settings: dict):
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(
+            json.dumps(settings, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def read_int(path: Path):
+    try:
+        return int(read_text(path))
+    except Exception:
+        return None
+
+
+def nice_name(text: str) -> str:
+    text = str(text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text or "sensor"
+
+
+def clean_hardware_name(name: str) -> str:
+    name = nice_name(name)
+    name = name.replace("(R)", "").replace("(TM)", "")
+    name = re.sub(r"\s+CPU\s*@.*$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+Processor\s*$", "", name, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+@lru_cache(maxsize=1)
+def get_cpu_model() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text(errors="ignore").splitlines():
+            if ":" not in line:
+                continue
+
+            key, value = line.split(":", 1)
+            if key.strip().lower() in {"model name", "hardware"}:
+                value = clean_hardware_name(value)
+                if value:
+                    return value
+
+    lscpu = shutil.which("lscpu")
+    if lscpu:
+        try:
+            result = subprocess.run(
+                [lscpu],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            for line in result.stdout.splitlines():
+                if line.lower().startswith("model name:"):
+                    return clean_hardware_name(line.split(":", 1)[1])
+        except Exception:
+            pass
+
+    return "CPU"
+
+
+def find_command(name: str):
+    candidates = [
+        shutil.which(name),
+        f"/usr/bin/{name}",
+        f"/usr/local/bin/{name}",
+        f"/run/current-system/sw/bin/{name}",
+        f"/run/opengl-driver/bin/{name}",
+    ]
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+
+    return None
+
+
+def run_short(command: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def format_gb(gb: float) -> str:
+    """
+    Show RAM/VRAM in GB only to avoid visual confusion.
+    """
+    return f"{gb:.1f} GB"
+
+
+def shorten_gpu_name(name: str) -> str:
+    name = clean_hardware_name(name)
+
+    replacements = [
+        ("NVIDIA Corporation", "NVIDIA"),
+        ("Advanced Micro Devices, Inc.", "AMD"),
+        ("ATI Technologies Inc.", "AMD"),
+        ("[AMD/ATI]", "AMD"),
+        ("VGA compatible controller:", ""),
+        ("3D controller:", ""),
+        ("Display controller:", ""),
+    ]
+
+    for old, new in replacements:
+        name = name.replace(old, new)
+
+    name = re.sub(r"\s+\(rev\s+[0-9a-fA-F]+\)$", "", name)
+    name = re.sub(r"\s+\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+
+    name = name.replace("NVIDIA NVIDIA", "NVIDIA", 1)
+    name = name.replace("AMD AMD", "AMD", 1)
+
+    return name
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_gpu_model() -> str:
+    nvidia_smi = find_command("nvidia-smi")
+    if nvidia_smi:
+        result = run_short([
+            nvidia_smi,
+            "--query-gpu=name",
+            "--format=csv,noheader,nounits",
+        ])
+        first = result.splitlines()[0].strip() if result else ""
+        if first:
+            return shorten_gpu_name(first)
+
+    return "NVIDIA GPU"
+
+
+@lru_cache(maxsize=1)
+def get_amd_gpu_model() -> str:
+    lspci = find_command("lspci")
+    if lspci:
+        result = run_short([lspci, "-mm"])
+        for line in result.splitlines():
+            low = line.lower()
+            if ("vga" in low or "3d controller" in low or "display controller" in low) and (
+                "amd" in low or "advanced micro devices" in low or "ati" in low
+            ):
+                fields = re.findall(r'"([^"]*)"', line)
+                if len(fields) >= 3:
+                    model = fields[2]
+                    if len(fields) > 3:
+                        model = f"{model} {fields[3]}"
+                    return shorten_gpu_name(model.strip())
+                return shorten_gpu_name(line)
+
+    return "AMD GPU"
+
+
+def normalize_label(label: str) -> str:
+    original = nice_name(label)
+    low = original.lower()
+
+    mapping = {
+        "cpu": "CPU",
+        "ram": "RAM",
+        "tctl": "CPU Tctl",
+        "tdie": "CPU Tdie",
+        "tccd1": "CPU CCD 1",
+        "tccd2": "CPU CCD 2",
+        "edge": "GPU Edge",
+        "junction": "GPU Junction",
+        "mem": "GPU memory",
+        "memory": "Memory",
+        "composite": "Composite",
+    }
+
+    if low in mapping:
+        return mapping[low]
+
+    if "amd tsi" in low or "tsi addr" in low:
+        return "AMD CPU via board"
+
+    if low.startswith("fan") and low[3:].isdigit():
+        return f"Fan {low[3:]}"
+
+    if low.startswith("pwm") and low[3:].isdigit():
+        return f"PWM {low[3:]}"
+
+    if low.startswith("in") and low[2:].isdigit():
+        return f"Voltage input {low[2:]}"
+
+    if low.startswith("temp") and low[4:].isdigit():
+        return f"Temp {low[4:]}"
+
+    if low.startswith("thermistor"):
+        number = original.split()[-1] if original.split() else ""
+        return f"Thermistor {number}".strip()
+
+    if low.startswith("diode"):
+        number = original.split()[-1] if original.split() else ""
+        return f"Diode {number}".strip()
+
+    if low.startswith("intrusion"):
+        number = re.sub(r"\D+", "", original)
+        return f"Intrusion {number}".strip()
+
+    return original
+
+
+def short_cpu_token() -> str:
+    """Short CPU model, e.g. 'AMD Ryzen 5 7500F 6-Core' -> '7500F'."""
+    model = get_cpu_model()
+    match = re.search(r"\b(\d{4,5}[A-Z]*)\b", model)
+    if match:
+        return match.group(1)
+    return "CPU"
+
+
+def short_gpu_token(model: str) -> str:
+    """Short GPU model, e.g. 'Navi 44 [Radeon RX 9050 / 9060 XT]' -> '9060 XT'."""
+    match = re.search(r"\b(\d{4}\s+[A-Z]{1,3})\b", model)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).upper()
+    match = re.search(r"\b(\d{4}[A-Z]*)\b", model)
+    if match:
+        return match.group(1)
+    return "GPU"
+
+
+def short_chip_token(chip: str) -> str:
+    """Compact chip identifier, in the style of psensor names."""
+    low = nice_name(chip).lower()
+    cpu_low = get_cpu_model().lower()
+
+    if low in {"k10temp", "zenpower", "cpu_amd"} or "amdcpu" in low or low.startswith("cpu_amd"):
+        return short_cpu_token()
+    if low in {"coretemp", "cpu_thermal"} or ("intel" in low and "cpu" in low):
+        return short_cpu_token()
+    if low == "cpu":
+        return short_cpu_token() if ("amd" in cpu_low or "ryzen" in cpu_low or "intel" in cpu_low or "core" in cpu_low) else "CPU"
+    if low.startswith(("nct668", "nct67", "nct677")) or "nuvoton" in low:
+        return "MB"
+    if "amdgpu" in low or low == "radeon":
+        return short_gpu_token(get_amd_gpu_model())
+    if "nvidia" in low:
+        return short_gpu_token(get_nvidia_gpu_model())
+    if low.startswith("nvme"):
+        return "NVMe"
+    if low == "system" or low in {"acpitz", "thermal"}:
+        return "SYS"
+    if low.startswith("iwlwifi") or "wifi" in low:
+        return "WiFi"
+    return nice_name(chip)
+
+
+def short_label_token(label: str, category: str) -> str:
+    """Compact label: Tctl -> TEMP, edge -> TEMP, CPU -> USAGE etc."""
+    original = nice_name(label)
+    low = original.lower()
+
+    mapping = {
+        "tctl": "TEMP",
+        "tdie": "TEMP",
+        "tccd1": "CCD1",
+        "tccd2": "CCD2",
+        "edge": "TEMP",
+        "junction": "JUNC",
+        "mem": "MEM",
+        "cpu": "USAGE",
+        "processor": "CPU",
+        "processador": "CPU",
+        "composite": "TEMP",
+        "sensor 1": "TEMP1",
+        "sensor 2": "TEMP2",
+        "pch_chip_cpu_max_temp": "PCH MAX",
+        "pch_chip_temp": "PCH",
+        "pch_cpu_temp": "PCH CPU",
+        "smbusmaster 0": "SMB0",
+        "tsi0_temp": "TSI0",
+        "vddgfx": "VDD",
+    }
+
+    if category == "Usage":
+        if "vram free" in low or "vram livre" in low:
+            return "VRAM FREE"
+        if "vram total" in low:
+            return "VRAM TOTAL"
+        if "vram used" in low or "vram usada" in low:
+            return "VRAM USED"
+        if "vram" in low:
+            return "VRAM"
+        if "memory" in low or "memoria" in low:
+            return "MEM USAGE"
+        if "gpu" in low:
+            return "USAGE"
+        if low.startswith("ram"):
+            return {
+                "ram": "RAM",
+                "ram used": "RAM USED",
+                "ram free": "RAM FREE",
+                "ram total": "RAM TOTAL",
+                "ram usada": "RAM USED",
+                "ram disponível": "RAM FREE",
+            }.get(low, "RAM")
+
+    if low in mapping:
+        return mapping[low]
+
+    match = re.match(r"^(fan|pwm|in|temp|curr|power)(\d+)$", low)
+    if match:
+        prefix = {"fan": "FAN", "pwm": "PWM", "in": "VIN", "temp": "TEMP", "curr": "I", "power": "P"}[match.group(1)]
+        return f"{prefix}{match.group(2)}"
+
+    match = re.match(r"^(voltage input|entrada de voltagem) (\d+)$", low)
+    if match:
+        return f"VIN{match.group(2)}"
+
+    match = re.match(r"^intrusion (\d+)$", low)
+    if match:
+        return f"INTR{match.group(1)}"
+
+    match = re.match(r"^intrusion(\d+)$", low)
+    if match:
+        return f"INTR{match.group(1)}"
+
+    match = re.match(r"^auxtin(\d+)$", low)
+    if match:
+        return f"AUX{match.group(1)}"
+
+    return re.sub(r"\s+", " ", original).upper()[:14]
+
+
+def friendly_chip_name(chip: str) -> str:
+    chip_clean = nice_name(chip)
+    low = chip_clean.lower()
+    cpu_model = get_cpu_model()
+
+    if low in {"k10temp", "zenpower"} or "amdcpu" in low or low.startswith("cpu_amd"):
+        return f"CPU AMD — {cpu_model}"
+
+    if low in {"coretemp", "cpu_thermal"} or ("intel" in low and "cpu" in low):
+        return f"CPU Intel — {cpu_model}"
+
+    if low.startswith("nct668") or low.startswith("nct67") or low.startswith("nct677") or low.startswith("nuvoton"):
+        return "Board — Nuvoton"
+
+    if "amdgpu" in low or low == "radeon":
+        return f"GPU AMD — {get_amd_gpu_model()}"
+
+    if "nvidia" in low:
+        return f"GPU NVIDIA — {get_nvidia_gpu_model()}"
+
+    if low == "cpu":
+        cpu_model = get_cpu_model()
+        cpu_model_lower = cpu_model.lower()
+        if "amd" in cpu_model_lower or "ryzen" in cpu_model_lower:
+            return f"CPU AMD — {cpu_model}"
+        if "intel" in cpu_model_lower or "core" in cpu_model_lower:
+            return f"CPU Intel — {cpu_model}"
+        return f"CPU — {cpu_model}"
+
+    if low == "system":
+        return "System"
+
+    if low.startswith("nvme"):
+        return "SSD NVMe"
+
+    if low in {"acpitz", "thermal"}:
+        return "System"
+
+    if low.startswith("iwlwifi") or "wifi" in low:
+        return "Wi-Fi"
+
+    return chip_clean
+
+
+def friendly_sensor_name(chip: str, label: str, category: str) -> str:
+    """Short name shown in the table, inspired by psensor names."""
+    chip_short = short_chip_token(chip)
+    label_short = short_label_token(label, category)
+
+    # Avoid duplication when the label already contains the GPU model.
+    if label_short.upper() == chip_short.upper() or label_short.upper() in chip_short.upper():
+        return label_short
+
+    return f"{chip_short} {label_short}"
+
+
+def friendly_sensor_full_name(chip: str, label: str) -> str:
+    """Full name, kept only in the tooltip to identify the sensor."""
+    return f"{friendly_chip_name(chip)} / {normalize_label(label)}"
+
+
+def label_for(hw: Path, prefix: str, number: str) -> str:
+    return nice_name(read_text(hw / f"{prefix}{number}_label") or f"{prefix}{number}")
+
+
+def add_reading(rows, chip, category, label, value, unit="", numeric=None):
+    chip_raw = nice_name(chip)
+    label_raw = nice_name(label)
+    category = nice_name(category)
+
+    rows.append(Reading(
+        key=f"{category}|{chip_raw}/{label_raw}",
+        category=category,
+        name=friendly_sensor_name(chip_raw, label_raw, category),
+        value=value,
+        unit=unit,
+        numeric=numeric,
+        full_name=friendly_sensor_full_name(chip_raw, label_raw),
+    ))
+
+
+def hwmon_temp(value: int):
+    return value / 1000.0 if abs(value) > 1000 else float(value)
+
+
+def hwmon_voltage(value: int):
+    return value / 1000.0
+
+
+def hwmon_power(value: int):
+    return value / 1_000_000.0
+
+
+def hwmon_current(value: int):
+    return value / 1000.0
+
+
+def hwmon_energy(value: int):
+    return value / 1_000_000.0
+
+
+def hwmon_pwm_percent(value: int):
+    if value < 0:
+        return None
+    return min(100.0, max(0.0, value * 100.0 / 255.0))
+
+
+
+
+def read_cpu_totals():
+    """
+    Read /proc/stat.
+    Return total and idle ticks since boot.
+    """
+    line = ""
+    try:
+        line = Path("/proc/stat").read_text(errors="ignore").splitlines()[0]
+    except Exception:
+        return None
+
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+
+    try:
+        values = [int(value) for value in parts[1:]]
+    except ValueError:
+        return None
+
+    if len(values) < 5:
+        return None
+
+    idle = values[3] + values[4]  # idle + iowait
+    total = sum(values)
+    return total, idle
+
+
+def get_cpu_usage_percent():
+    """
+    Calculate CPU usage from the delta between reads.
+    The first read uses a quick estimate to avoid a false 0.
+    """
+    global _LAST_CPU_TOTAL, _LAST_CPU_IDLE
+
+    current = read_cpu_totals()
+    if current is None:
+        return None
+
+    total, idle = current
+
+    if _LAST_CPU_TOTAL is None or _LAST_CPU_IDLE is None:
+        _LAST_CPU_TOTAL = total
+        _LAST_CPU_IDLE = idle
+        return None
+
+    delta_total = total - _LAST_CPU_TOTAL
+    delta_idle = idle - _LAST_CPU_IDLE
+
+    _LAST_CPU_TOTAL = total
+    _LAST_CPU_IDLE = idle
+
+    if delta_total <= 0:
+        return None
+
+    usage = (1.0 - (delta_idle / delta_total)) * 100.0
+    return max(0.0, min(100.0, usage))
+
+
+def get_ram_info():
+    """
+    Usa MemAvailable para estimar uso real de RAM.
+    Retorna valores em MB e percentual.
+    """
+    values = {}
+
+    try:
+        for line in Path("/proc/meminfo").read_text(errors="ignore").splitlines():
+            if ":" not in line:
+                continue
+
+            key, value = line.split(":", 1)
+            number = value.strip().split()[0]
+            values[key] = int(number)
+    except Exception:
+        return None
+
+    total_kb = values.get("MemTotal")
+    available_kb = values.get("MemAvailable")
+
+    if not total_kb or available_kb is None:
+        return None
+
+    used_kb = total_kb - available_kb
+
+    total_gb = total_kb / 1024.0 / 1024.0
+    used_gb = used_kb / 1024.0 / 1024.0
+    available_gb = available_kb / 1024.0 / 1024.0
+    percent = max(0.0, min(100.0, used_gb * 100.0 / total_gb))
+
+    return {
+        "used_gb": used_gb,
+        "available_gb": available_gb,
+        "total_gb": total_gb,
+        "percent": percent,
+    }
+
+
+def get_ram_usage_percent():
+    info = get_ram_info()
+    if not info:
+        return None
+    return info["percent"]
+
+
+def scan_basic_usage():
+    rows = []
+
+    cpu_model = get_cpu_model()
+    if cpu_model != "CPU":
+        add_reading(rows, "system", "Status", "Processor", cpu_model, "", None)
+
+    cpu_usage = get_cpu_usage_percent()
+    if cpu_usage is None:
+        add_reading(rows, "cpu", "Usage", "CPU", "coletando", "%", None)
+    else:
+        add_reading(rows, "cpu", "Usage", "CPU", f"{cpu_usage:.0f}", "%", cpu_usage)
+
+    ram_info = get_ram_info()
+    if ram_info is not None:
+        ram_usage = ram_info["percent"]
+        add_reading(rows, "system", "Usage", "RAM", f"{ram_usage:.0f}", "%", ram_usage)
+
+        used_gb = ram_info["used_gb"]
+        available_gb = ram_info["available_gb"]
+        total_gb = ram_info["total_gb"]
+
+        add_reading(rows, "system", "Usage", "RAM used", f"{used_gb:.1f}", "GB", used_gb)
+        add_reading(rows, "system", "Usage", "RAM free", f"{available_gb:.1f}", "GB", available_gb)
+        add_reading(rows, "system", "Usage", "RAM total", f"{total_gb:.1f}", "GB", total_gb)
+
+    return rows
+
+
+def scan_nvidia_usage():
+    global _LAST_NVIDIA_USAGE_ROWS, _LAST_NVIDIA_USAGE_TIME
+
+    nvidia_smi = find_command("nvidia-smi")
+    if not nvidia_smi:
+        return cached_nvidia_usage_rows()
+
+    try:
+        result = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return cached_nvidia_usage_rows()
+
+    if result.returncode != 0:
+        return cached_nvidia_usage_rows()
+
+    rows = []
+
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 5:
+            continue
+
+        name, gpu_usage, mem_usage, mem_used, mem_total = parts[:5]
+        gpu = shorten_gpu_name(name)
+
+        if valid_nvidia_value(gpu_usage):
+            try:
+                value = float(gpu_usage)
+                add_reading(rows, "nvidia", "Usage", f"{gpu} GPU", f"{value:.0f}", "%", value)
+            except ValueError:
+                pass
+
+        if valid_nvidia_value(mem_usage):
+            try:
+                value = float(mem_usage)
+                add_reading(rows, "nvidia", "Usage", f"{gpu} memory controller", f"{value:.0f}", "%", value)
+            except ValueError:
+                pass
+
+        if valid_nvidia_value(mem_used) and valid_nvidia_value(mem_total):
+            try:
+                used = float(mem_used)
+                total = float(mem_total)
+                if total > 0:
+                    value = used * 100.0 / total
+                    free = max(0.0, total - used)
+
+                    used_gb = used / 1024.0
+                    free_gb = free / 1024.0
+                    total_gb = total / 1024.0
+
+                    add_reading(rows, "nvidia", "Usage", f"{gpu} VRAM", f"{value:.0f}", "%", value)
+                    add_reading(rows, "nvidia", "Usage", f"{gpu} VRAM used", f"{used_gb:.1f}", "GB", used_gb)
+                    add_reading(rows, "nvidia", "Usage", f"{gpu} VRAM free", f"{free_gb:.1f}", "GB", free_gb)
+                    add_reading(rows, "nvidia", "Usage", f"{gpu} VRAM total", f"{total_gb:.1f}", "GB", total_gb)
+            except ValueError:
+                pass
+
+    if rows:
+        _LAST_NVIDIA_USAGE_ROWS = list(rows)
+        _LAST_NVIDIA_USAGE_TIME = time.monotonic()
+    else:
+        rows = cached_nvidia_usage_rows()
+
+    return rows
+
+
+def read_sysfs_float(path: Path):
+    text = read_text(path)
+    if not text:
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def scan_amdgpu_usage():
+    rows = []
+    seen_cards = set()
+
+    for card in sorted(Path("/sys/class/drm").glob("card*")):
+        if "-" in card.name:
+            continue
+
+        device = card / "device"
+        if not device.exists():
+            continue
+
+        driver = ""
+        try:
+            driver = device.joinpath("driver").resolve().name.lower()
+        except Exception:
+            pass
+
+        vendor = read_text(device / "vendor").lower()
+
+        if driver != "amdgpu" and vendor != "0x1002":
+            continue
+
+        if str(device) in seen_cards:
+            continue
+        seen_cards.add(str(device))
+
+        gpu_name = get_amd_gpu_model()
+
+        busy_path = device / "gpu_busy_percent"
+        busy = read_sysfs_float(busy_path)
+        if busy is not None:
+            value = max(0.0, min(100.0, busy))
+            add_reading(rows, "amdgpu", "Usage", f"{gpu_name} GPU", f"{value:.0f}", "%", value)
+
+        mem_busy_path = device / "mem_busy_percent"
+        mem_busy = read_sysfs_float(mem_busy_path)
+        if mem_busy is not None:
+            value = max(0.0, min(100.0, mem_busy))
+            add_reading(rows, "amdgpu", "Usage", f"{gpu_name} memory", f"{value:.0f}", "%", value)
+
+        vram_used = read_sysfs_float(device / "mem_info_vram_used")
+        vram_total = read_sysfs_float(device / "mem_info_vram_total")
+        if vram_used is not None and vram_total and vram_total > 0:
+            value = max(0.0, min(100.0, vram_used * 100.0 / vram_total))
+
+            used_gb = vram_used / 1024.0 / 1024.0 / 1024.0
+            total_gb = vram_total / 1024.0 / 1024.0 / 1024.0
+            free_gb = max(0.0, total_gb - used_gb)
+
+            add_reading(rows, "amdgpu", "Usage", f"{gpu_name} VRAM", f"{value:.0f}", "%", value)
+            add_reading(rows, "amdgpu", "Usage", f"{gpu_name} VRAM used", f"{used_gb:.1f}", "GB", used_gb)
+            add_reading(rows, "amdgpu", "Usage", f"{gpu_name} VRAM free", f"{free_gb:.1f}", "GB", free_gb)
+            add_reading(rows, "amdgpu", "Usage", f"{gpu_name} VRAM total", f"{total_gb:.1f}", "GB", total_gb)
+
+    return rows
+
+
+def scan_usage():
+    rows = []
+    rows.extend(scan_basic_usage())
+    rows.extend(scan_nvidia_usage())
+    rows.extend(scan_amdgpu_usage())
+    return rows
+
+def scan_hwmon():
+    rows = []
+
+    if not HWMON.exists():
+        return rows
+
+    for hw in sorted(HWMON.glob("hwmon*")):
+        chip = nice_name(read_text(hw / "name") or hw.name)
+
+        for path in sorted(hw.glob("temp*_input")):
+            match = re.match(r"temp(\d+)_input$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            value = hwmon_temp(raw)
+            if value <= -100:
+                continue
+
+            number = match.group(1)
+            add_reading(rows, chip, "Temp", label_for(hw, "temp", number), f"{value:.1f}", "°C", value)
+
+        for path in sorted(hw.glob("fan*_input")):
+            match = re.match(r"fan(\d+)_input$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            number = match.group(1)
+            add_reading(rows, chip, "Fan", label_for(hw, "fan", number), str(raw), "RPM", float(raw))
+
+        for path in sorted(hw.glob("in*_input")):
+            match = re.match(r"in(\d+)_input$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            value = hwmon_voltage(raw)
+            number = match.group(1)
+            add_reading(rows, chip, "Volt", label_for(hw, "in", number), f"{value:.3f}", "V", value)
+
+        for path in sorted(hw.glob("power*_input")):
+            match = re.match(r"power(\d+)_input$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            value = hwmon_power(raw)
+            number = match.group(1)
+            add_reading(rows, chip, "Power", label_for(hw, "power", number), f"{value:.2f}", "W", value)
+
+        for path in sorted(hw.glob("curr*_input")):
+            match = re.match(r"curr(\d+)_input$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            value = hwmon_current(raw)
+            number = match.group(1)
+            add_reading(rows, chip, "Curr", label_for(hw, "curr", number), f"{value:.3f}", "A", value)
+
+        for path in sorted(hw.glob("energy*_input")):
+            match = re.match(r"energy(\d+)_input$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            value = hwmon_energy(raw)
+            number = match.group(1)
+            add_reading(rows, chip, "Energy", label_for(hw, "energy", number), f"{value:.2f}", "J", value)
+
+        for path in sorted(hw.glob("pwm*")):
+            match = re.match(r"pwm(\d+)$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            value = hwmon_pwm_percent(raw)
+            if value is None:
+                continue
+
+            number = match.group(1)
+            add_reading(rows, chip, "PWM", label_for(hw, "pwm", number), f"{value:.0f}", "%", value)
+
+        for path in sorted(hw.glob("intrusion*_alarm")):
+            match = re.match(r"intrusion(\d+)_alarm$", path.name)
+            if not match:
+                continue
+
+            raw = read_int(path)
+            if raw is None:
+                continue
+
+            number = match.group(1)
+            add_reading(rows, chip, "Status", f"intrusion{number}", "ALARM" if raw else "OK", "", None)
+
+    return rows
+
+
+def scan_thermal_zones():
+    rows = []
+
+    if not THERMAL.exists():
+        return rows
+
+    for zone in sorted(THERMAL.glob("thermal_zone*")):
+        raw = read_int(zone / "temp")
+        if raw is None:
+            continue
+
+        value = hwmon_temp(raw)
+        if value <= -100:
+            continue
+
+        add_reading(
+            rows,
+            "thermal",
+            "Temp",
+            read_text(zone / "type") or zone.name,
+            f"{value:.1f}",
+            "°C",
+            value,
+        )
+
+    return rows
+
+
+def valid_nvidia_value(value: str) -> bool:
+    return value.strip().lower() not in {
+        "",
+        "[not supported]",
+        "not supported",
+        "[n/a]",
+        "n/a",
+        "na",
+        "none",
+        "unknown",
+    }
+
+
+
+def cache_valid(timestamp: float) -> bool:
+    return (time.monotonic() - timestamp) <= NVIDIA_CACHE_SECONDS
+
+
+def cached_nvidia_usage_rows():
+    if _LAST_NVIDIA_USAGE_ROWS and cache_valid(_LAST_NVIDIA_USAGE_TIME):
+        return list(_LAST_NVIDIA_USAGE_ROWS)
+    return []
+
+
+def cached_nvidia_sensor_rows():
+    if _LAST_NVIDIA_SENSOR_ROWS and cache_valid(_LAST_NVIDIA_SENSOR_TIME):
+        return list(_LAST_NVIDIA_SENSOR_ROWS)
+    return []
+
+def scan_nvidia_smi():
+    global _LAST_NVIDIA_SENSOR_ROWS, _LAST_NVIDIA_SENSOR_TIME
+
+    nvidia_smi = find_command("nvidia-smi")
+    if not nvidia_smi:
+        return cached_nvidia_sensor_rows()
+
+    try:
+        result = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=name,temperature.gpu,fan.speed,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return cached_nvidia_sensor_rows()
+
+    if result.returncode != 0:
+        return cached_nvidia_sensor_rows()
+
+    rows = []
+
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+
+        name, temp, fan, power = parts[:4]
+        gpu = shorten_gpu_name(name)
+
+        if valid_nvidia_value(temp):
+            try:
+                value = float(temp)
+                add_reading(rows, "nvidia", "Temp", f"{gpu} GPU", f"{value:.1f}", "°C", value)
+            except ValueError:
+                pass
+
+        if valid_nvidia_value(fan):
+            try:
+                value = float(fan)
+                add_reading(rows, "nvidia", "Fan", f"{gpu} Fan", f"{value:.0f}", "%", value)
+            except ValueError:
+                pass
+
+        if valid_nvidia_value(power):
+            try:
+                value = float(power)
+                add_reading(rows, "nvidia", "Power", f"{gpu} Power", f"{value:.2f}", "W", value)
+            except ValueError:
+                pass
+
+    if rows:
+        _LAST_NVIDIA_SENSOR_ROWS = list(rows)
+        _LAST_NVIDIA_SENSOR_TIME = time.monotonic()
+    else:
+        rows = cached_nvidia_sensor_rows()
+
+    return rows
+
+
+def scan_sensors():
+    rows = scan_usage()
+    hwmon_rows = scan_hwmon()
+    rows.extend(hwmon_rows)
+
+    if not hwmon_rows:
+        rows.extend(scan_thermal_zones())
+
+    existing_names = " ".join(row.name.lower() for row in hwmon_rows)
+    if "nvidia" not in existing_names:
+        rows.extend(scan_nvidia_smi())
+
+    merged = {}
+    for row in rows:
+        merged[row.key] = row
+
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            CATEGORY_ORDER.get(row.category, 99),
+            row.name.lower(),
+            row.unit,
+        ),
+    )
+
+
+def format_minmax(value: float | None, unit: str) -> str:
+    if value is None:
+        return "—"
+
+    if unit == "°C":
+        return f"{value:.1f} °C"
+    if unit == "RPM":
+        return f"{value:.0f} RPM"
+    if unit == "%":
+        return f"{value:.0f} %"
+    if unit == "V":
+        return f"{value:.3f} V"
+    if unit == "W":
+        return f"{value:.2f} W"
+    if unit == "A":
+        return f"{value:.3f} A"
+    if unit == "J":
+        return f"{value:.2f} J"
+    if unit == "GB":
+        return format_gb(value)
+
+    return f"{value:.2f} {unit}".strip()
+
+
+class PySensorQt(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("PySensor Qt")
+        self.setMinimumSize(360, 180)
+
+        self.settings = load_settings()
+        self.fit_on_startup = bool(self.settings.get("fit_on_startup", True))
+        saved_size = self.settings.get("window_size", [720, 380])
+        try:
+            self.resize(max(360, int(saved_size[0])), max(180, int(saved_size[1])))
+        except (TypeError, ValueError, IndexError):
+            self.resize(720, 380)
+        self.hidden_sensors = set(self.settings.get("hidden_sensors", []))
+        self.hidden_sensor_info = self.settings.get("hidden_sensor_info", {})
+        self.favorite_sensors = set(self.settings.get("favorite_sensors", []))
+        self.favorite_sensor_info = self.settings.get("favorite_sensor_info", {})
+        self.show_only_favorites = bool(self.settings.get("show_only_favorites", False))
+        self.category_visible = self.settings.get("category_visible", {category: True for category in CATEGORIES})
+
+        self.minmax = {}
+        self.log_path = None
+        self.last_rows = []
+        self.category_actions = {}
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Type", "HW", "Sensor", "Now", "Min", "Max"])
+        header = self.table.horizontalHeader()
+        for column in range(6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        # Sensor column fits its content instead of stretching with the window.
+        header.setMaximumSectionSize(190)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_sensor_context_menu)
+
+        self.status_label = QLabel("Waiting for sensor readings...")
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 60)
+        self.interval_spin.setValue(2)
+        self.interval_spin.setSuffix(" s")
+        self.interval_spin.setToolTip("Refresh interval (seconds)")
+        self.interval_spin.valueChanged.connect(lambda _value: self.update_timer_interval())
+
+        self.category_combo = QComboBox()
+        self.category_combo.addItems(["All", "Fav"] + CATEGORIES)
+        self.category_combo.setToolTip("Sensor filter (All / Fav / category)")
+        self.category_combo.currentTextChanged.connect(lambda _text: self.render_table())
+
+        self.order_combo = QComboBox()
+        self.order_combo.addItems(["HW", "Cat"])
+        saved_order = self.settings.get("order_mode", "Hardware")
+        self.order_combo.setCurrentText(
+            "Cat" if saved_order in ("Category", "Categoria", "Cat") else "HW"
+        )
+        self.order_combo.setToolTip("Sort order: HW = hardware, Cat = category")
+        self.order_combo.currentTextChanged.connect(lambda _text: self.set_order_mode())
+
+        self.hide_zero_check = QCheckBox("Hide zeros")
+        self.hide_zero_check.setToolTip("Hide zeroed sensors, except Usage")
+        self.hide_zero_check.setChecked(bool(self.settings.get("hide_zero", False)))
+        self.hide_zero_check.stateChanged.connect(lambda _state: self.set_hide_zero())
+
+        self.favorites_button = QPushButton("Fav (0)")
+        self.favorites_button.clicked.connect(lambda _checked=False: self.toggle_only_favorites())
+
+        self.hidden_button = QPushButton("Hidden")
+        self.hidden_button.setToolTip("Hidden sensors")
+        self.hidden_button.clicked.connect(lambda _checked=False: self.show_hidden_dialog())
+
+        self.reset_button = QPushButton("Reset min/max")
+        self.reset_button.clicked.connect(lambda _checked=False: self.reset_minmax())
+
+        self.log_check = QCheckBox("Log CSV")
+        self.log_check.stateChanged.connect(lambda _state: self.toggle_log())
+
+        self.choose_log_button = QPushButton("Choose CSV")
+        self.choose_log_button.clicked.connect(lambda _checked=False: self.choose_log_file())
+
+        # Advanced controls live in the menus so the window can stay small.
+        for widget in (self.hide_zero_check, self.reset_button, self.log_check, self.choose_log_button):
+            widget.hide()
+
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(1, 2, 1, 2)
+        top_bar.setSpacing(2)
+        top_bar.addWidget(self.category_combo)
+        top_bar.addWidget(self.order_combo)
+        top_bar.addWidget(self.favorites_button)
+        top_bar.addWidget(self.hidden_button)
+        top_bar.addStretch()
+        top_bar.addWidget(self.interval_spin)
+
+        layout = QVBoxLayout()
+        layout.addLayout(top_bar)
+        layout.addWidget(self.table)
+        layout.addWidget(self.status_label)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+
+        self.build_menu()
+        self.update_timer_interval()
+        self.refresh()
+
+    def build_menu(self):
+        file_menu = self.menuBar().addMenu("File")
+
+        refresh_action = QAction("Refresh now", self)
+        refresh_action.triggered.connect(lambda _checked=False: self.refresh())
+        file_menu.addAction(refresh_action)
+
+        reset_action = QAction("Reset min/max", self)
+        reset_action.triggered.connect(lambda _checked=False: self.reset_minmax())
+        file_menu.addAction(reset_action)
+
+        self.log_action = QAction("Log CSV", self)
+        self.log_action.setCheckable(True)
+        self.log_action.setChecked(self.log_check.isChecked())
+        self.log_action.triggered.connect(lambda checked: self.log_check.setChecked(checked))
+        file_menu.addAction(self.log_action)
+
+        choose_log_action = QAction("Choose CSV file...", self)
+        choose_log_action.triggered.connect(lambda _checked=False: self.choose_log_file())
+        file_menu.addAction(choose_log_action)
+
+        file_menu.addSeparator()
+
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        view_menu = self.menuBar().addMenu("View")
+
+        category_menu = view_menu.addMenu("Categories")
+        for category in CATEGORIES:
+            action = QAction(category, self)
+            action.setCheckable(True)
+            action.setChecked(bool(self.category_visible.get(category, True)))
+            action.triggered.connect(lambda checked, cat=category: self.set_category_visible(cat, checked))
+            category_menu.addAction(action)
+            self.category_actions[category] = action
+
+        category_menu.addSeparator()
+
+        show_all_categories = QAction("Show all categories", self)
+        show_all_categories.triggered.connect(lambda _checked=False: self.set_all_categories(True))
+        category_menu.addAction(show_all_categories)
+
+        hide_all_categories = QAction("Hide all categories", self)
+        hide_all_categories.triggered.connect(lambda _checked=False: self.set_all_categories(False))
+        category_menu.addAction(hide_all_categories)
+
+        view_menu.addSeparator()
+
+        self.hide_zero_action = QAction("Hide zeros", self)
+        self.hide_zero_action.setCheckable(True)
+        self.hide_zero_action.setChecked(self.hide_zero_check.isChecked())
+        self.hide_zero_action.triggered.connect(lambda checked: self.hide_zero_check.setChecked(checked))
+        view_menu.addAction(self.hide_zero_action)
+
+        self.show_all_action = QAction("Show All Sensors", self)
+        self.show_all_action.setCheckable(True)
+        self.show_all_action.setChecked(not self.show_only_favorites)
+        self.show_all_action.triggered.connect(lambda checked: self.set_only_favorites(not checked))
+        view_menu.addAction(self.show_all_action)
+
+        clear_favorites_action = QAction("Clear favorites", self)
+        clear_favorites_action.triggered.connect(lambda _checked=False: self.clear_favorites())
+        view_menu.addAction(clear_favorites_action)
+
+        view_menu.addSeparator()
+
+        hidden_action = QAction("Hidden sensors...", self)
+        hidden_action.triggered.connect(lambda _checked=False: self.show_hidden_dialog())
+        view_menu.addAction(hidden_action)
+
+        restore_all_action = QAction("Restore all sensors", self)
+        restore_all_action.triggered.connect(lambda _checked=False: self.restore_all_sensors())
+        view_menu.addAction(restore_all_action)
+
+        view_menu.addSeparator()
+
+        self.fit_action = QAction("Fit to content", self)
+        self.fit_action.setCheckable(True)
+        self.fit_action.setChecked(self.fit_on_startup)
+        self.fit_action.setToolTip(
+            "Auto-fit the window as readings arrive. Click to apply now."
+        )
+        self.fit_action.triggered.connect(self.on_fit_toggled)
+        view_menu.addAction(self.fit_action)
+
+    def fit_window_to_content(self):
+        """Shrink the window to the smallest size that still shows the table content."""
+        table = self.table
+        columns_width = sum(table.columnWidth(index) for index in range(table.columnCount()))
+        rows_height = sum(table.rowHeight(index) for index in range(table.rowCount()))
+
+        if not table.horizontalHeader().isHidden():
+            rows_height += table.horizontalHeader().height()
+        if not table.verticalHeader().isHidden():
+            columns_width += table.verticalHeader().width()
+        if table.verticalScrollBar().isVisible():
+            columns_width += table.verticalScrollBar().width()
+        if table.horizontalScrollBar().isVisible():
+            rows_height += table.horizontalScrollBar().height()
+
+        content_width = columns_width + table.frameWidth() * 2 + 2
+        content_height = rows_height + table.frameWidth() * 2 + 2
+
+        # Force the layout to account for every row/column, then restore the normal
+        # table minimum so the user can still resize the window freely afterwards.
+        table.setMinimumSize(content_width, content_height)
+        QApplication.processEvents()
+        hint = self.minimumSizeHint()
+        table.setMinimumSize(0, 0)
+
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            frame = self.frameGeometry()
+            frame_width = max(0, frame.width() - self.width())
+            frame_height = max(0, frame.height() - self.height())
+            width = min(hint.width(), available.width() - frame_width)
+            height = min(hint.height(), available.height() - frame_height)
+        else:
+            width, height = hint.width(), hint.height()
+
+        self.resize(max(width, self.minimumWidth()), max(height, self.minimumHeight()))
+        QApplication.processEvents()
+
+    def on_fit_toggled(self, checked: bool):
+        self.fit_on_startup = bool(checked)
+        if self.fit_on_startup:
+            self.fit_window_to_content()
+        self.save_ui_settings()
+
+    def update_timer_interval(self):
+        self.timer.start(self.interval_spin.value() * 1000)
+
+    def save_ui_settings(self):
+        self.settings["hidden_sensors"] = sorted(self.hidden_sensors)
+        self.settings["hidden_sensor_info"] = self.hidden_sensor_info
+        self.settings["favorite_sensors"] = sorted(self.favorite_sensors)
+        self.settings["favorite_sensor_info"] = self.favorite_sensor_info
+        self.settings["show_only_favorites"] = self.show_only_favorites
+        self.settings["category_visible"] = self.category_visible
+        self.settings["hide_zero"] = self.hide_zero_check.isChecked()
+        if hasattr(self, "order_combo"):
+            self.settings["order_mode"] = (
+                "Category" if self.order_combo.currentText() == "Cat" else "Hardware"
+            )
+        self.settings["fit_on_startup"] = self.fit_on_startup
+        self.settings["window_size"] = [self.width(), self.height()]
+        save_settings(self.settings)
+
+    def closeEvent(self, event):
+        self.save_ui_settings()
+        super().closeEvent(event)
+
+    def set_order_mode(self):
+        self.save_ui_settings()
+        self.render_table()
+
+    def apply_minimal_preset(self, rows):
+        """On first run, show only the essential sensors (psensor style)."""
+        targets = [
+            lambda row: row.category == "Usage" and row.key.lower() == "usage|cpu/cpu",
+            lambda row: row.category == "Temp" and row.key.lower().endswith("/tctl"),
+            lambda row: row.category == "Temp" and row.key.lower().endswith("/tccd1"),
+            lambda row: row.category == "Temp" and "amdgpu/edge" in row.key.lower(),
+        ]
+
+        keys = []
+        for matches in targets:
+            key = next((row.key for row in rows if matches(row)), None)
+            if key and key not in keys:
+                keys.append(key)
+
+        if not keys:
+            return
+
+        self.favorite_sensors = set(keys)
+        self.favorite_sensor_info = {
+            row.key: {"name": row.name, "category": row.category}
+            for row in rows
+            if row.key in keys
+        }
+        self.show_only_favorites = True
+        if hasattr(self, "show_all_action"):
+            self.show_all_action.setChecked(False)
+        self.settings["minimal_mode_v2"] = True
+        self.save_ui_settings()
+
+    def set_only_favorites(self, enabled: bool):
+        self.show_only_favorites = bool(enabled)
+        if hasattr(self, "show_all_action"):
+            self.show_all_action.setChecked(not self.show_only_favorites)
+        self.save_ui_settings()
+        self.render_table()
+
+    def toggle_only_favorites(self):
+        self.set_only_favorites(not self.show_only_favorites)
+
+    def clear_favorites(self):
+        self.favorite_sensors.clear()
+        self.favorite_sensor_info.clear()
+        self.save_ui_settings()
+        self.render_table()
+
+    def update_favorites_button(self):
+        count = len(self.favorite_sensors)
+        if self.show_only_favorites:
+            self.favorites_button.setText(f"Fav ({count}) ✓")
+            self.favorites_button.setToolTip("Showing favorites only. Click to show all sensors.")
+        else:
+            self.favorites_button.setText(f"Fav ({count})")
+            self.favorites_button.setToolTip("Favorites. Click to show favorites only.")
+
+    def set_hide_zero(self):
+        self.save_ui_settings()
+        self.render_table()
+
+    def set_category_visible(self, category: str, visible: bool):
+        self.category_visible[category] = bool(visible)
+        if category in self.category_actions:
+            self.category_actions[category].setChecked(bool(visible))
+        self.save_ui_settings()
+        self.render_table()
+
+    def set_all_categories(self, visible: bool):
+        for category in CATEGORIES:
+            self.category_visible[category] = bool(visible)
+            if category in self.category_actions:
+                self.category_actions[category].setChecked(bool(visible))
+        self.save_ui_settings()
+        self.render_table()
+
+    def choose_log_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Choose CSV file",
+            str(Path.home() / "sensores.csv"),
+            "CSV (*.csv);;All files (*)",
+        )
+
+        if path:
+            self.log_path = Path(path)
+            self.log_check.setChecked(True)
+            if hasattr(self, "log_action"):
+                self.log_action.setChecked(True)
+            self.status_label.setText(f"Log CSV: {self.log_path}")
+
+    def toggle_log(self):
+        if self.log_check.isChecked() and self.log_path is None:
+            self.log_path = Path.home() / "sensores.csv"
+            self.status_label.setText(f"Log CSV: {self.log_path}")
+
+    def reset_minmax(self):
+        self.minmax.clear()
+        self.refresh()
+
+    def restore_all_sensors(self):
+        self.hidden_sensors.clear()
+        self.hidden_sensor_info.clear()
+        self.save_ui_settings()
+        self.render_table()
+
+    def should_show(self, row: Reading) -> bool:
+        selected = self.category_combo.currentText()
+        if selected in ("Fav", "Favorites"):
+            if row.key not in self.favorite_sensors:
+                return False
+        elif selected != "All" and row.category != selected:
+            return False
+
+        if self.show_only_favorites and row.key not in self.favorite_sensors:
+            return False
+
+        if not self.category_visible.get(row.category, True):
+            return False
+
+        if row.key in self.hidden_sensors:
+            return False
+
+        # "Hide zeros" is useful for unplugged fans, missing voltages and spare PWMs,
+        # but it must not hide Usage, because 0% GPU/CPU is a valid idle reading.
+        if self.hide_zero_check.isChecked() and row.numeric == 0 and row.category != "Usage":
+            return False
+
+        return True
+
+    def refresh(self):
+        rows = scan_sensors()
+        self.last_rows = rows
+
+        if not self.settings.get("minimal_mode_v2"):
+            self.apply_minimal_preset(rows)
+
+        if not rows:
+            self.table.setRowCount(0)
+            self.update_hidden_button()
+            self.status_label.setText("No sensors found. Try: sensors")
+            return
+
+        for row in rows:
+            self.hidden_sensor_info[row.key] = {
+                "name": row.name,
+                "category": row.category,
+            }
+
+            if row.key in self.favorite_sensors:
+                self.favorite_sensor_info[row.key] = {
+                    "name": row.name,
+                    "category": row.category,
+                }
+
+            if row.numeric is None:
+                continue
+
+            if row.key not in self.minmax:
+                self.minmax[row.key] = {"min": row.numeric, "max": row.numeric, "unit": row.unit}
+            else:
+                self.minmax[row.key]["min"] = min(self.minmax[row.key]["min"], row.numeric)
+                self.minmax[row.key]["max"] = max(self.minmax[row.key]["max"], row.numeric)
+                self.minmax[row.key]["unit"] = row.unit
+
+        self.save_ui_settings()
+        self.render_table()
+
+        if self.log_check.isChecked():
+            self.write_log(rows)
+
+    def render_table(self):
+        rows = [row for row in self.last_rows if self.should_show(row)]
+
+        if self.order_combo.currentText() == "HW":
+            rows.sort(key=lambda row: (
+                hardware_group(row),
+                CATEGORY_ORDER.get(row.category, 99),
+                row.name.lower(),
+            ))
+
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(rows))
+
+        for table_row, row in enumerate(rows):
+            current = f"{row.value} {row.unit}".strip()
+
+            min_value = "—"
+            max_value = "—"
+
+            if row.key in self.minmax:
+                unit = self.minmax[row.key].get("unit", row.unit)
+
+                if unit == "GB":
+                    min_value = format_gb(self.minmax[row.key]["min"])
+                    max_value = format_gb(self.minmax[row.key]["max"])
+                else:
+                    min_value = format_minmax(self.minmax[row.key]["min"], unit)
+                    max_value = format_minmax(self.minmax[row.key]["max"], unit)
+
+            hw_index = hardware_group(row)
+            values = [
+                row.category,
+                hardware_tag(row),
+                row.name,
+                current,
+                min_value,
+                max_value,
+            ]
+
+            for offset, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                item.setData(Qt.ItemDataRole.UserRole, row.key)
+
+                if offset >= 3:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+                if offset == 1:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                    item.setForeground(hardware_color(row))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    group_name = (
+                        HARDWARE_GROUPS[hw_index][0]
+                        if hw_index < len(HARDWARE_GROUPS)
+                        else "Other"
+                    )
+                    item.setToolTip(f"{group_name} sensor")
+
+                if offset == 2 and row.full_name:
+                    item.setToolTip(row.full_name)
+
+                if row.category == "Temp" and offset == 3 and row.numeric is not None:
+                    if row.numeric >= 85:
+                        item.setToolTip("High temperature")
+                    elif row.numeric >= 70:
+                        item.setToolTip("Warm temperature")
+
+                if row.category == "Status" and str(row.value).upper() == "ALARM":
+                    item.setToolTip("Sensor in alarm state")
+
+                self.table.setItem(table_row, offset, item)
+
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.table.blockSignals(False)
+
+        now = datetime.now().strftime("%H:%M:%S")
+        total = len(self.last_rows)
+        shown = len(rows)
+        hidden = len(self.hidden_sensors)
+        hidden_categories = sum(1 for category in CATEGORIES if not self.category_visible.get(category, True))
+
+        self.update_hidden_button()
+        self.update_favorites_button()
+        self.status_label.setText(
+            f"{now} | {shown}/{total} sensors | ★ {len(self.favorite_sensors)}"
+        )
+        self.status_label.setToolTip(
+            f"Last update: {now}\n"
+            f"Shown: {shown}/{total}\n"
+            f"Favorites: {len(self.favorite_sensors)}\n"
+            f"Hidden sensors: {hidden}\n"
+            f"Hidden categories: {hidden_categories}"
+        )
+
+        # The first readings can still be placeholders ("—"), so the initial fit is
+        # too small. Re-fit whenever the rendered content changes size.
+        if self.fit_on_startup:
+            content_size = (
+                sum(self.table.columnWidth(index) for index in range(self.table.columnCount())),
+                sum(self.table.rowHeight(index) for index in range(self.table.rowCount())),
+            )
+            if content_size != getattr(self, "last_fit_content", None):
+                self.last_fit_content = content_size
+                QTimer.singleShot(0, self.fit_window_to_content)
+
+    def hide_sensor(self, key: str):
+        row = next((sensor for sensor in self.last_rows if sensor.key == key), None)
+        if row:
+            self.hidden_sensor_info[key] = {
+                "name": row.name,
+                "category": row.category,
+            }
+        self.hidden_sensors.add(key)
+        self.save_ui_settings()
+        self.render_table()
+
+    def show_sensor(self, key: str):
+        self.hidden_sensors.discard(key)
+        self.save_ui_settings()
+        self.render_table()
+
+    def set_favorite(self, key: str, enabled: bool):
+        if enabled:
+            self.favorite_sensors.add(key)
+            row = next((sensor for sensor in self.last_rows if sensor.key == key), None)
+            if row:
+                self.favorite_sensor_info[key] = {
+                    "name": row.name,
+                    "category": row.category,
+                }
+            elif key in self.hidden_sensor_info:
+                self.favorite_sensor_info[key] = dict(self.hidden_sensor_info[key])
+        else:
+            self.favorite_sensors.discard(key)
+            self.favorite_sensor_info.pop(key, None)
+        self.save_ui_settings()
+        self.render_table()
+
+    def show_sensor_context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if not item:
+            return
+
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not key or not any(row.key == key for row in self.last_rows):
+            return
+
+        menu = QMenu(self)
+        is_favorite = key in self.favorite_sensors
+        favorite_action = menu.addAction(
+            "Remove from favorites" if is_favorite else "Add to favorites"
+        )
+        hide_action = menu.addAction("Hide sensor")
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == favorite_action:
+            self.set_favorite(key, not is_favorite)
+        elif chosen == hide_action:
+            self.hide_sensor(key)
+
+    def update_hidden_button(self):
+        count = len(self.hidden_sensors)
+        self.hidden_button.setText(f"Hidden {count}")
+        self.hidden_button.setToolTip(f"Hidden sensors ({count}). Click to manage them.")
+
+    def show_hidden_dialog(self):
+        if not self.hidden_sensors:
+            QMessageBox.information(self, "Hidden sensors", "No sensors are hidden right now.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Hidden sensors")
+        dialog.resize(720, 420)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Hidden sensors. Select one or more:"))
+
+        hidden_list = QListWidget()
+        hidden_list.setAlternatingRowColors(True)
+        hidden_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        hidden_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+        def populate():
+            hidden_list.clear()
+            for key in sorted(
+                self.hidden_sensors,
+                key=lambda item: self.hidden_sensor_info.get(item, {}).get("name", item).lower(),
+            ):
+                info = self.hidden_sensor_info.get(key, {})
+                name = info.get("name", key)
+                category = info.get("category", "Sensor")
+                item = QListWidgetItem(f"[{category}] {name}")
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setData(Qt.ItemDataRole.UserRole, key)
+                item.setToolTip("Right-click for options")
+                hidden_list.addItem(item)
+
+        populate()
+        layout.addWidget(hidden_list)
+
+        def selected_keys():
+            return [item.data(Qt.ItemDataRole.UserRole) for item in hidden_list.selectedItems()]
+
+        def show_selected():
+            for key in selected_keys():
+                self.hidden_sensors.discard(key)
+            self.save_ui_settings()
+            populate()
+            self.render_table()
+
+        def favorite_selected():
+            for key in selected_keys():
+                self.set_favorite(key, True)
+            populate()
+
+        def show_all():
+            self.restore_all_sensors()
+            populate()
+
+        def show_hidden_menu(pos):
+            item = hidden_list.itemAt(pos)
+            if not item:
+                return
+
+            key = item.data(Qt.ItemDataRole.UserRole)
+            menu = QMenu(dialog)
+            show_action = menu.addAction("Show sensor")
+            favorite_action = menu.addAction(
+                "Remove from favorites" if key in self.favorite_sensors else "Add to favorites"
+            )
+            chosen = menu.exec(hidden_list.viewport().mapToGlobal(pos))
+            if chosen == show_action:
+                self.show_sensor(key)
+                populate()
+            elif chosen == favorite_action:
+                self.set_favorite(key, key not in self.favorite_sensors)
+
+        hidden_list.customContextMenuRequested.connect(show_hidden_menu)
+
+        button_bar = QHBoxLayout()
+        show_selected_button = QPushButton("Show selected")
+        favorite_selected_button = QPushButton("Add selected to favorites")
+        show_all_button = QPushButton("Show all")
+        close_button = QPushButton("Close")
+
+        show_selected_button.clicked.connect(show_selected)
+        favorite_selected_button.clicked.connect(favorite_selected)
+        show_all_button.clicked.connect(show_all)
+        close_button.clicked.connect(dialog.reject)
+
+        button_bar.addStretch()
+        button_bar.addWidget(show_selected_button)
+        button_bar.addWidget(favorite_selected_button)
+        button_bar.addWidget(show_all_button)
+        button_bar.addWidget(close_button)
+
+        layout.addLayout(button_bar)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def write_log(self, rows):
+        if self.log_path is None:
+            self.log_path = Path.home() / "sensores.csv"
+
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            new_file = not self.log_path.exists()
+
+            with self.log_path.open("a", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+
+                if new_file:
+                    writer.writerow(["timestamp", "category", "sensor", "value", "unit"])
+
+                timestamp = datetime.now().isoformat(timespec="seconds")
+
+                for row in rows:
+                    writer.writerow([timestamp, row.category, row.name, row.value, row.unit])
+
+        except Exception as error:
+            self.log_check.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "Log error",
+                f"Could not write CSV:\n\n{error}",
+            )
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = PySensorQt()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

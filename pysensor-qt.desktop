@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PySensor Qt
+GenericName=Sensor monitor
+Comment=Compact sensor monitor with short names and hardware sorting
+Exec=pysensor-qt
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
